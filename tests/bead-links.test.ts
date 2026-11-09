@@ -16,6 +16,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import type { MarkdownTransformContext, MarkdownTransformer } from "@earendil-works/pi-coding-agent";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const extension = path.join(repoRoot, "extensions", "bead-links.ts");
@@ -72,31 +73,27 @@ const bead = (workspace: Workspace, id: string, type = "task"): void => {
 	bd(workspace.dir, workspace.home, ["create", `Bead ${id}`, "--id", id, "--type", type, "--quiet"]);
 };
 
-/** What pi tells a markdown transformer about the message it is drawing. */
-type MarkdownContext = {
-	messageType: "user" | "assistant" | "assistant-thinking";
-	isStreaming: boolean;
-	availableWidth: number;
-};
+const assistant: MarkdownTransformContext = { messageType: "assistant", isStreaming: false, availableWidth: 80 };
+const fromTheUser: MarkdownTransformContext = { messageType: "user", isStreaming: false, availableWidth: 80 };
 
-const assistant: MarkdownContext = { messageType: "assistant", isStreaming: false, availableWidth: 80 };
-const fromTheUser: MarkdownContext = { messageType: "user", isStreaming: false, availableWidth: 80 };
+/** The events the extension subscribes to; a test naming another one is a mistake. */
+type EventName = "session_start" | "turn_end";
 
 /** The events and transformer pi receives from the extension, standing in for pi's API. */
 type Seam = {
-	fire: (event: string, cwd: string) => Promise<void>;
-	transform: (markdown: string, context: MarkdownContext) => string;
+	fire: (event: EventName, cwd: string) => Promise<void>;
+	transform: MarkdownTransformer;
 };
 
 /** The extension as pi loads it: the handlers it subscribes, and the transformer it registers. */
 async function loadExtension(): Promise<Seam> {
-	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
-	let transformer: ((markdown: string, context: MarkdownContext) => string) | undefined;
+	const handlers = new Map<EventName, (event: unknown, ctx: unknown) => unknown>();
+	let transformer: MarkdownTransformer | undefined;
 	const pi = {
-		on(event: string, handler: (event: unknown, ctx: unknown) => unknown): void {
+		on(event: EventName, handler: (event: unknown, ctx: unknown) => unknown): void {
 			handlers.set(event, handler);
 		},
-		registerMarkdownTransformer(candidate: (markdown: string, context: MarkdownContext) => string): void {
+		registerMarkdownTransformer(candidate: MarkdownTransformer): void {
 			transformer = candidate;
 		},
 	};
@@ -105,29 +102,35 @@ async function loadExtension(): Promise<Seam> {
 	assert.ok(transformer, "the extension registered a markdown transformer");
 	return {
 		fire: async (event, cwd) => {
-			await handlers.get(event)?.({}, { cwd });
+			const handler = handlers.get(event);
+			assert.ok(handler, `the extension subscribed to ${event}`);
+			await handler({}, { cwd });
 		},
 		transform: transformer,
 	};
 }
 
-/** An assistant reply as pi's renderer receives it, after the extension's transformer. */
-async function renderReply(workspace: Workspace, markdown: string, context = assistant): Promise<string> {
+/** The extension with a session already started in the workspace's repo, its ids loaded. */
+async function startSession(workspace: Workspace): Promise<Seam> {
 	const seam = await loadExtension();
 	await seam.fire("session_start", workspace.dir);
-	return seam.transform(markdown, context);
+	return seam;
+}
+
+/** An assistant reply as pi's renderer receives it, after the extension's transformer. */
+async function renderReply(
+	workspace: Workspace,
+	markdown: string,
+	context: MarkdownTransformContext = assistant,
+): Promise<string> {
+	const { transform } = await startSession(workspace);
+	return transform(markdown, context);
 }
 
 type PiOutput = { status: number | null; stdout: string; stderr: string };
 
-/** What a test changes about the session: the Bead its first request creates, and its environment. */
-type RunOptions = { createOnFirstRequest?: string; environment?: Record<string, string> };
-
-/**
- * A pi session in print mode with the extension, the test provider and the test's reply.
- * The environment has no board port unless the test gives one.
- */
-function runPi(workspace: Workspace, prompts: string[], reply: string, options: RunOptions = {}): PiOutput {
+/** A pi session in print mode with the extension, the test provider and the test's reply. */
+function runPi(workspace: Workspace, prompts: string[], reply: string): PiOutput {
 	const env: NodeJS.ProcessEnv = { ...process.env };
 	delete env.BEADS_BOARD_PORT;
 	const result = spawnSync(
@@ -155,9 +158,7 @@ function runPi(workspace: Workspace, prompts: string[], reply: string, options: 
 				PI_OFFLINE: "1",
 				PI_TELEMETRY: "0",
 				BEAD_LINKS_TEST_REPLY: reply,
-				BEAD_LINKS_TEST_CREATE: options.createOnFirstRequest ?? "",
 				BEAD_LINKS_TEST_LOG: workspace.log,
-				...options.environment,
 			},
 		},
 	);
@@ -189,10 +190,16 @@ test("the board's port comes from BEADS_BOARD_PORT, and is 3917 without it", asy
 	try {
 		bead(workspace, "fac-abc");
 		delete process.env.BEADS_BOARD_PORT;
-		assert.equal(await renderReply(workspace, "Bead fac-abc is ready."), `Bead ${link("fac-abc", workspace.dir, 3917)} is ready.`);
+		assert.equal(
+			await renderReply(workspace, "Bead fac-abc is ready."),
+			`Bead ${link("fac-abc", workspace.dir, 3917)} is ready.`,
+		);
 
 		process.env.BEADS_BOARD_PORT = "4400";
-		assert.equal(await renderReply(workspace, "Bead fac-abc is ready."), `Bead ${link("fac-abc", workspace.dir, 4400)} is ready.`);
+		assert.equal(
+			await renderReply(workspace, "Bead fac-abc is ready."),
+			`Bead ${link("fac-abc", workspace.dir, 4400)} is ready.`,
+		);
 	} finally {
 		if (original === undefined) delete process.env.BEADS_BOARD_PORT;
 		else process.env.BEADS_BOARD_PORT = original;
@@ -222,10 +229,7 @@ test("only ids that exist in the repo become links; code, existing links and the
 			"Bead fac-abc.1.",
 		].join("\n");
 		const linked = reply
-			.replace(
-				"Bead fac-abc.1 is ready.",
-				`Bead ${link("fac-abc.1", workspace.dir)} is ready.`,
-			)
+			.replace("Bead fac-abc.1 is ready.", `Bead ${link("fac-abc.1", workspace.dir)} is ready.`)
 			.replace("Bead fac-abc.1.", `Bead ${link("fac-abc.1", workspace.dir)}.`);
 		assert.equal(await renderReply(workspace, reply), linked);
 		assert.equal(await renderReply(workspace, reply, fromTheUser), reply, "the user's words are not linked");
@@ -238,8 +242,7 @@ test("a Bead created during one turn becomes a link in the next turn's reply", a
 	const workspace = makeWorkspace();
 	try {
 		bead(workspace, "fac-abc", "epic");
-		const seam = await loadExtension();
-		await seam.fire("session_start", workspace.dir);
+		const seam = await startSession(workspace);
 		bead(workspace, "fac-abc.2");
 		await seam.fire("turn_end", workspace.dir);
 		assert.equal(
