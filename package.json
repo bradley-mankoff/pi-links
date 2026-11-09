@@ -1,0 +1,10 @@
+{
+  "name": "pi-links",
+  "version": "0.1.0",
+  "description": "Links in pi replies: each real Bead id becomes a terminal link to that Bead on the Beads board.",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "pi": { "extensions": ["./extensions"] },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+  "scripts": { "test": "node --experimental-strip-types --no-warnings --test tests/*.test.ts" }
+}
