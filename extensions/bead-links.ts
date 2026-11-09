@@ -1,6 +1,6 @@
 /**
- * bead-links: turns each real Bead id in the model's replies into an OSC 8 link to that
- * Bead on the board, so a Ctrl-click opens it beside the conversation (fac-qpv.7.1).
+ * bead-links: turns each real Bead id in the model's replies into a link to that Bead on
+ * the board, so a Ctrl-click opens it beside the conversation (fac-qpv.7.1).
  *
  * The link is http://127.0.0.1:<port>/#/board?issue=<id>&workspace=<repo path>: the board
  * otherwise looks the id up in whichever project it last showed, so the workspace names the
@@ -14,10 +14,15 @@
  * its later ids plain. Fenced code blocks, code spans and existing links and URLs are left
  * as they are.
  *
- * It follows the work Mac's file-links.ts, which links file paths in replies the same way.
+ * The link is a markdown link `[<id>](<url>)` handed to pi through its markdown transformer,
+ * so pi's renderer draws the id alone, clickable, and the reply text pi keeps for the model
+ * never holds a link. Writing the terminal's own escapes into the reply looked right in
+ * print mode, which passes the text through, but pi's TUI stripped them, leaving the URL in
+ * the conversation (pi-links-gzj). It follows the work Mac's file-links.ts, which links file
+ * paths in replies the same way.
  */
 import { execFile } from "node:child_process";
-import type { AgentMessage, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const DEFAULT_PORT = 3917;
 
@@ -55,9 +60,6 @@ type Board = { repo: string; port: number; ids: Set<string> };
 const boardUrl = (id: string, board: Board): string =>
 	`http://127.0.0.1:${board.port}/#/board?issue=${encodeURIComponent(id)}&workspace=${encodeURIComponent(board.repo)}`;
 
-/** The OSC 8 sequence pi itself uses for a link. */
-const hyperlink = (text: string, url: string): string => `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\`;
-
 /**
  * Leftmost alternative wins: existing links, autolinks and URLs are kept as written, then
  * code spans, then a whole word that may be a Bead id. A sentence's trailing dot is not
@@ -71,7 +73,7 @@ const linkLine = (line: string, board: Board): string =>
 		KEPT_OR_WORD,
 		(match, kept: string | undefined, code: string | undefined, word: string | undefined) =>
 			kept === undefined && code === undefined && word && board.ids.has(word)
-				? hyperlink(word, boardUrl(word, board))
+				? `[${word}](<${boardUrl(word, board)}>)`
 				: match,
 	);
 
@@ -91,38 +93,12 @@ const linkMarkdown = (markdown: string, board: Board): string => {
 		.join("\n");
 };
 
-/** Every text block of an assistant message mapped; the same message when none changed. */
-const mapText = (message: AgentMessage, map: (text: string) => string): AgentMessage => {
-	if (message.role !== "assistant") return message;
-	let changed = false;
-	const content = message.content.map((block) => {
-		if (block.type !== "text") return block;
-		const text = map(block.text);
-		if (text === block.text) return block;
-		changed = true;
-		return { ...block, text };
-	});
-	return changed ? { ...message, content } : message;
-};
-
-const linkMessage = (message: AgentMessage, board: Board): AgentMessage =>
-	mapText(message, (text) => linkMarkdown(text, board));
-
-/** An OSC 8 link's opening sequence, which carries the URL, and its closing one. */
-const OSC8 = /\x1b]8;[^\x1b\x07]*(?:\x1b\\|\x07)/g;
-
-/** The same message with the terminal's links removed, for the model to read. */
-const plainMessage = (message: AgentMessage): AgentMessage => mapText(message, (text) => text.replace(OSC8, ""));
-
 export default function beadLinks(pi: ExtensionAPI): void {
 	const board: Board = { repo: "", port: DEFAULT_PORT, ids: new Set() };
-	let loading: Promise<void> = Promise.resolve();
 
-	const refresh = (cwd: string): Promise<void> => {
-		loading = listIds(cwd).then((listed) => {
-			if (listed) board.ids = new Set(listed);
-		});
-		return loading;
+	const refresh = async (cwd: string): Promise<void> => {
+		const listed = await listIds(cwd);
+		if (listed) board.ids = new Set(listed);
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -131,21 +107,12 @@ export default function beadLinks(pi: ExtensionAPI): void {
 		await refresh(ctx.cwd);
 	});
 	// A turn may create Beads with a tool call, so the ids are reloaded after each turn,
-	// before the next model request.
+	// in time for the next reply to link them.
 	pi.on("turn_end", async (_event, ctx) => {
 		await refresh(ctx.cwd);
 	});
-	pi.on("message_end", async (event) => {
-		if (event.message.role !== "assistant") return;
-		await loading;
-		if (board.ids.size === 0) return;
-		const message = linkMessage(event.message, board);
-		return message === event.message ? undefined : { message };
-	});
-	// The model reads its own earlier replies on the next request. The escapes are for the
-	// terminal, so they are removed from what it is sent, and a quoted id stays a plain id.
-	pi.on("context", (event) => {
-		const messages = event.messages.map(plainMessage);
-		return messages.some((message, i) => message !== event.messages[i]) ? { messages } : undefined;
-	});
+	// Only the assistant's reply is drawn with links; the message pi keeps stays as written.
+	pi.registerMarkdownTransformer((markdown, context) =>
+		context.messageType === "assistant" ? linkMarkdown(markdown, board) : markdown,
+	);
 }
